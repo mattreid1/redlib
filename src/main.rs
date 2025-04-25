@@ -410,6 +410,7 @@ async fn main() {
 
 	// API routes
 	app.at("/api/posts/:id/comments").get(|r| post::api_post_comments(r).boxed());
+	app.at("/api/r/:sub/posts").get(|r| subreddit::api_subreddit_posts(r).boxed());
 
 	// Default service in case no routes match
 	app.at("/*").get(|req| error(req, "Nothing here").boxed());

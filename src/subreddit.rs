@@ -16,6 +16,8 @@ use chrono::DateTime;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use time::{Duration, OffsetDateTime};
+use serde::Serialize;
+use serde_json;
 
 // STRUCTS
 #[derive(Template)]
@@ -59,6 +61,60 @@ struct WallTemplate {
 }
 
 static GEO_FILTER_MATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"geo_filter=(?<region>\w+)").unwrap());
+
+/// Minimal, serializable post for API output (borrowing, no Clone)
+#[derive(Serialize)]
+pub struct FlatPost<'a> {
+	pub id: &'a str,
+	pub title: &'a str,
+	pub community: &'a str,
+	pub body: &'a str,
+	pub author: &'a crate::utils::Author,
+	pub permalink: &'a str,
+	pub score: &'a (String, String),
+	pub upvote_ratio: i64,
+	pub post_type: &'a str,
+	pub flair: &'a crate::utils::Flair,
+	pub flags: &'a crate::utils::Flags,
+	pub rel_time: &'a str,
+	pub created: &'a str,
+	pub created_ts: u64,
+	pub num_duplicates: u64,
+	pub comments: &'a (String, String),
+	pub awards: &'a crate::utils::Awards,
+	pub nsfw: bool,
+}
+
+impl<'a> FlatPost<'a> {
+	pub fn from_post(p: &'a crate::utils::Post) -> Self {
+		FlatPost {
+			id: &p.id,
+			title: &p.title,
+			community: &p.community,
+			body: &p.body,
+			author: &p.author,
+			permalink: &p.permalink,
+			score: &p.score,
+			upvote_ratio: p.upvote_ratio,
+			post_type: &p.post_type,
+			flair: &p.flair,
+			flags: &p.flags,
+			rel_time: &p.rel_time,
+			created: &p.created,
+			created_ts: p.created_ts,
+			num_duplicates: p.num_duplicates,
+			comments: &p.comments,
+			awards: &p.awards,
+			nsfw: p.nsfw,
+		}
+	}
+}
+
+#[derive(Serialize)]
+pub struct PaginatedPosts<'a> {
+	pub items: &'a [FlatPost<'a>],
+	pub after: Option<&'a str>,
+}
 
 // SERVICES
 pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -643,6 +699,61 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 	res.headers_mut().insert(CONTENT_TYPE, hyper::header::HeaderValue::from_static("application/rss+xml"));
 
 	Ok(res)
+}
+
+/// API handler: GET /api/r/:sub/posts (clone-free, borrowing)
+pub async fn api_subreddit_posts(req: Request<Body>) -> Result<Response<Body>, String> {
+	let sub = req.param("sub").ok_or_else(|| "Missing subreddit".to_string())?;
+	let limit: usize = req
+		.uri()
+		.query()
+		.and_then(|q| url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "limit").and_then(|(_, v)| v.parse().ok()))
+		.unwrap_or(25)
+		.min(100);
+	let after = req
+		.uri()
+		.query()
+		.and_then(|q| url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "after").map(|(_, v)| v.into_owned()));
+	let sort = req
+		.uri()
+		.query()
+		.and_then(|q| url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "sort").map(|(_, v)| v.into_owned()))
+		.unwrap_or_else(|| "hot".to_string());
+
+	// Build Reddit API path, including after and limit if present
+	let mut path = format!("/r/{}/{}.json?raw_json=1", sub, sort);
+	let mut params = vec![];
+	if let Some(ref after_val) = after {
+		params.push(format!("after={}", after_val));
+	}
+	if limit != 25 {
+		params.push(format!("limit={}", limit));
+	}
+	if !params.is_empty() {
+		path.push('&');
+		path.push_str(&params.join("&"));
+	}
+	let quarantined = false;
+	let (posts, reddit_after) = match crate::utils::Post::fetch(&path, quarantined).await {
+		Ok((posts, after)) => (posts, after),
+		Err(msg) => return Err(msg),
+	};
+
+	// Build borrowed FlatPost list
+	let flat_posts: Vec<_> = posts.iter().map(FlatPost::from_post).collect();
+
+	// No local pagination; just return what Reddit gave us
+	let items = &flat_posts[..];
+	let after_val = if reddit_after.is_empty() { None } else { Some(reddit_after.as_str()) };
+	let resp = PaginatedPosts {
+		items,
+		after: after_val,
+	};
+	let body = serde_json::to_vec(&resp).map_err(|e| e.to_string())?;
+	Ok(Response::builder()
+		.header("content-type", "application/json")
+		.body(Body::from(body))
+		.unwrap())
 }
 
 #[tokio::test(flavor = "multi_thread")]
