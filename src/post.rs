@@ -14,6 +14,8 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use rinja::Template;
 use std::collections::{HashMap, HashSet};
+use serde::Serialize;
+use serde_json;
 
 // STRUCTS
 #[derive(Template)]
@@ -30,6 +32,58 @@ struct PostTemplate {
 }
 
 static COMMENT_SEARCH_CAPTURE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\?q=(.*)&type=comment").unwrap());
+
+/// Minimal, serializable comment for API output (borrowing, no Clone)
+#[derive(Serialize)]
+pub struct FlatComment<'a> {
+	pub id: &'a str,
+	pub kind: &'a str,
+	pub parent_id: &'a str,
+	pub parent_kind: &'a str,
+	pub post_link: &'a str,
+	pub post_author: &'a str,
+	pub body: &'a str,
+	pub author: &'a crate::utils::Author,
+	pub score: &'a (String, String),
+	pub rel_time: &'a str,
+	pub created: &'a str,
+	pub edited: &'a (String, String),
+	pub highlighted: bool,
+	pub awards: &'a crate::utils::Awards,
+	pub collapsed: bool,
+	pub is_filtered: bool,
+	pub more_count: i64,
+}
+
+impl<'a> FlatComment<'a> {
+	pub fn from_comment(c: &'a crate::utils::Comment) -> Self {
+		FlatComment {
+			id: &c.id,
+			kind: &c.kind,
+			parent_id: &c.parent_id,
+			parent_kind: &c.parent_kind,
+			post_link: &c.post_link,
+			post_author: &c.post_author,
+			body: &c.body,
+			author: &c.author,
+			score: &c.score,
+			rel_time: &c.rel_time,
+			created: &c.created,
+			edited: &c.edited,
+			highlighted: c.highlighted,
+			awards: &c.awards,
+			collapsed: c.collapsed,
+			is_filtered: c.is_filtered,
+			more_count: c.more_count,
+		}
+	}
+}
+
+#[derive(Serialize)]
+pub struct PaginatedComments<'a> {
+	pub items: &'a [FlatComment<'a>],
+	pub after: Option<&'a str>,
+}
 
 pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Build Reddit API path
@@ -254,4 +308,58 @@ fn build_comment(
 		more_count,
 		prefs: Preferences::new(req),
 	}
+}
+
+/// API handler: GET /api/posts/{post_id}/comments (clone-free, borrowing)
+pub async fn api_post_comments(req: Request<Body>) -> Result<Response<Body>, String> {
+	// Extract post_id from path
+	let post_id = req.param("id").ok_or_else(|| "Missing post_id".to_string())?;
+	let limit: usize = req
+		.uri()
+		.query()
+		.and_then(|q| url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "limit").and_then(|(_, v)| v.parse().ok()))
+		.unwrap_or(25)
+		.min(100);
+	let after = req
+		.uri()
+		.query()
+		.and_then(|q| url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "after").map(|(_, v)| v.into_owned()));
+
+	// Build Reddit API path
+	let path = format!("/comments/{post_id}.json?raw_json=1");
+	let quarantined = false; // Comments are public
+	let response = match json(path, quarantined).await {
+		Ok(response) => response,
+		Err(msg) => return Err(msg),
+	};
+	let post = parse_post(&response[0]["data"]["children"][0]).await;
+	let comments = parse_comments(&response[1], &post.permalink, &post.author.name, "", &get_filters(&req), &req);
+
+	// Flatten comments tree to a list for pagination
+	fn flatten_comments<'a>(comments: &'a [crate::utils::Comment], out: &mut Vec<FlatComment<'a>>) {
+		for c in comments {
+			out.push(FlatComment::from_comment(c));
+			flatten_comments(&c.replies, out);
+		}
+	}
+	let mut flat_comments = Vec::new();
+	flatten_comments(&comments, &mut flat_comments);
+
+	// Pagination logic
+	let start = after
+		.as_ref()
+		.and_then(|after_id| flat_comments.iter().position(|c| c.id == after_id).map(|idx| idx + 1))
+		.unwrap_or(0);
+	let end = (start + limit).min(flat_comments.len());
+	let items = &flat_comments[start..end];
+	let after_val = items.last().map(|c| c.id);
+	let resp = PaginatedComments {
+		items,
+		after: after_val,
+	};
+	let body = serde_json::to_vec(&resp).map_err(|e| e.to_string())?;
+	Ok(Response::builder()
+		.header("content-type", "application/json")
+		.body(Body::from(body))
+		.unwrap())
 }

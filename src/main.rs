@@ -408,6 +408,9 @@ async fn main() {
 		})
 	});
 
+	// API routes
+	app.at("/api/posts/:id/comments").get(|r| post::api_post_comments(r).boxed());
+
 	// Default service in case no routes match
 	app.at("/*").get(|req| error(req, "Nothing here").boxed());
 
