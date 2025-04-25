@@ -8,7 +8,7 @@ This document describes the JSON API endpoints for Redlib. All endpoints return 
 
 **Endpoint:**
 ```
-GET /api/posts/{post_id}/comments
+GET /api/post/{post_id}/comments
 ```
 
 **Query Parameters:**
@@ -17,7 +17,7 @@ GET /api/posts/{post_id}/comments
 
 **Example Request:**
 ```
-GET /api/posts/abc123/comments?limit=10&after=def456
+GET /api/post/abc123/comments?limit=10&after=def456
 ```
 
 **Example Response:**
@@ -67,17 +67,18 @@ GET /api/r/rust/posts?limit=5&after=xyz123&sort=new
 
 **Endpoint:**
 ```
-GET /api/users/{user_id}/posts
+GET /api/user/{user_id}/posts
 ```
 
 **Query Parameters:**
+- `where` (optional, string): Which listing to return (`overview`, `submitted`, `comments`; default: `overview`)
 - `limit` (optional, integer): Maximum number of posts to return (default: 25, max: 100)
 - `after` (optional, string): Return posts after this post ID (for pagination)
 - `sort` (optional, string): Sort order (`new`, `top`, etc.; default: `new`)
 
 **Example Request:**
 ```
-GET /api/users/spez/posts?limit=10&sort=top
+GET /api/user/spez/posts?where=overview&limit=10&sort=top
 ```
 
 **Example Response:**
