@@ -481,6 +481,7 @@ pub struct Comment {
 	pub score: (String, String),
 	pub rel_time: String,
 	pub created: String,
+	pub created_ts: u64,
 	pub edited: (String, String),
 	pub replies: Vec<Comment>,
 	pub highlighted: bool,

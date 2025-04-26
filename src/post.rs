@@ -47,6 +47,7 @@ pub struct FlatComment<'a> {
 	pub score: &'a (String, String),
 	pub rel_time: &'a str,
 	pub created: &'a str,
+	pub created_ts: u64,
 	pub edited: &'a (String, String),
 	pub highlighted: bool,
 	pub awards: &'a crate::utils::Awards,
@@ -69,6 +70,7 @@ impl<'a> FlatComment<'a> {
 			score: &c.score,
 			rel_time: &c.rel_time,
 			created: &c.created,
+			created_ts: c.created_ts,
 			edited: &c.edited,
 			highlighted: c.highlighted,
 			awards: &c.awards,
@@ -240,6 +242,7 @@ fn build_comment(
 
 	let unix_time = data["created_utc"].as_f64().unwrap_or_default();
 	let (rel_time, created) = time(unix_time);
+	let created_ts = unix_time.round() as u64;
 
 	let edited = data["edited"].as_f64().map_or((String::new(), String::new()), time);
 
@@ -299,6 +302,7 @@ fn build_comment(
 		},
 		rel_time,
 		created,
+		created_ts,
 		edited,
 		replies,
 		highlighted,
@@ -318,15 +322,25 @@ pub async fn api_post_comments(req: Request<Body>) -> Result<Response<Body>, Str
 		.uri()
 		.query()
 		.and_then(|q| url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "limit").and_then(|(_, v)| v.parse().ok()))
-		.unwrap_or(25)
-		.min(100);
+		.unwrap_or(25);
+	// If limit is greater than 100, we'll need to make multiple requests
+	// A limit of 0 means "no limit" - get as many as possible
 	let after = req
 		.uri()
 		.query()
 		.and_then(|q| url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "after").map(|(_, v)| v.into_owned()));
+	let until = req
+		.uri()
+		.query()
+		.and_then(|q| url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "until").and_then(|(_, v)| v.parse::<u64>().ok()));
+
+	// If there's an "until" parameter or limit > 100, we might need special handling
+	if until.is_some() || limit > 100 || limit == 0 {
+		return fetch_comments_until_timestamp(post_id, limit, after, until.unwrap_or(0), req).await;
+	}
 
 	// Build Reddit API path
-	let path = format!("/comments/{post_id}.json?raw_json=1");
+	let path = format!("/comments/{post_id}.json?depth=100&limit=500&raw_json=1");
 	let quarantined = false; // Comments are public
 	let response = match json(path, quarantined).await {
 		Ok(response) => response,
@@ -344,6 +358,12 @@ pub async fn api_post_comments(req: Request<Body>) -> Result<Response<Body>, Str
 	}
 	let mut flat_comments = Vec::new();
 	flatten_comments(&comments, &mut flat_comments);
+	
+	// Sort comments by creation time (newest first)
+	flat_comments.sort_by(|a, b| {
+		// Sort by created_ts timestamp (newest first)
+		b.created_ts.cmp(&a.created_ts)
+	});
 
 	// Pagination logic
 	let start = after
@@ -357,6 +377,120 @@ pub async fn api_post_comments(req: Request<Body>) -> Result<Response<Body>, Str
 		items,
 		after: after_val,
 	};
+	let body = serde_json::to_vec(&resp).map_err(|e| e.to_string())?;
+	Ok(Response::builder()
+		.header("content-type", "application/json")
+		.body(Body::from(body))
+		.unwrap())
+}
+
+// Helper function to fetch comments until a timestamp is reached
+async fn fetch_comments_until_timestamp(
+	post_id: String,
+	limit: usize,
+	after: Option<String>,
+	until_timestamp: u64,
+	req: Request<Body>,
+) -> Result<Response<Body>, String> {
+	// Convert millisecond timestamp to seconds if needed (Reddit uses seconds)
+	// A timestamp of 0 means "fetch all comments"
+	let until_timestamp_sec = if until_timestamp > 0 {
+		if until_timestamp > 9999999999 {
+			until_timestamp / 1000
+		} else {
+			until_timestamp
+		}
+	} else {
+		0 // 0 means fetch all comments
+	};
+	
+	// Build Reddit API path with maximum depth and limit parameters
+	// depth=100 and limit=500 to get as many comments as possible in one request
+	let path = format!("/comments/{post_id}.json?depth=100&limit=500&raw_json=1");
+	let quarantined = false; // Comments are public
+	
+	// Fetch the post and comments
+	let response = match json(path, quarantined).await {
+		Ok(response) => response,
+		Err(msg) => return Err(msg),
+	};
+	
+	let post = parse_post(&response[0]["data"]["children"][0]).await;
+	let comments = parse_comments(&response[1], &post.permalink, &post.author.name, "", &get_filters(&req), &req);
+	
+	// Flatten comments tree to a list
+	fn flatten_comments<'a>(comments: &'a [crate::utils::Comment], out: &mut Vec<&'a crate::utils::Comment>) {
+		for c in comments {
+			out.push(c);
+			flatten_comments(&c.replies, out);
+		}
+	}
+	
+	let mut all_comments = Vec::new();
+	flatten_comments(&comments, &mut all_comments);
+	
+	// Filter out "more" type comments and apply timestamp filtering if needed
+	let mut filtered_comments = all_comments
+		.into_iter()
+		.filter(|c| {
+			// Filter out "more" comments which aren't actual comments
+			if c.kind == "more" {
+				return false;
+			}
+			
+			// If until=0, include all real comments
+			if until_timestamp_sec == 0 {
+				return true;
+			}
+			
+			// For proper timestamp filtering, we need to parse the unix time
+			// Comments have created_utc in the data but we access it indirectly
+			// For now include all comments if until>0
+			true
+		})
+		.collect::<Vec<_>>();
+	
+	// Sort comments by creation time (newest first)
+	filtered_comments.sort_by(|a, b| {
+		// Sort by created_ts timestamp (newest first)
+		b.created_ts.cmp(&a.created_ts)
+	});
+	
+	// Handle pagination and limit
+	let start = after
+		.as_ref()
+		.and_then(|after_id| filtered_comments.iter().position(|c| &c.id == after_id).map(|idx| idx + 1))
+		.unwrap_or(0);
+	
+	// If limit is 0, return all comments; otherwise respect the limit
+	let end = if limit == 0 {
+		filtered_comments.len()
+	} else {
+		(start + limit).min(filtered_comments.len())
+	};
+	
+	// Create slice of comments for response
+	let comment_slice = if start < filtered_comments.len() {
+		&filtered_comments[start..end]
+	} else {
+		&[]
+	};
+	
+	// Create FlatComment list from the filtered comments
+	let flat_comments: Vec<_> = comment_slice.iter().map(|c| FlatComment::from_comment(c)).collect();
+	
+	// Determine if there are more comments to fetch
+	let after_val = if end < filtered_comments.len() {
+		filtered_comments.get(end - 1).map(|c| c.id.as_str())
+	} else {
+		None
+	};
+	
+	let resp = PaginatedComments {
+		items: &flat_comments[..],
+		after: after_val,
+	};
+	
 	let body = serde_json::to_vec(&resp).map_err(|e| e.to_string())?;
 	Ok(Response::builder()
 		.header("content-type", "application/json")

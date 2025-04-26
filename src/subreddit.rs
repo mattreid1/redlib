@@ -708,8 +708,9 @@ pub async fn api_subreddit_posts(req: Request<Body>) -> Result<Response<Body>, S
 		.uri()
 		.query()
 		.and_then(|q| url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "limit").and_then(|(_, v)| v.parse().ok()))
-		.unwrap_or(25)
-		.min(100);
+		.unwrap_or(25);
+	// If limit is greater than 100, we'll need to make multiple requests
+	// A limit of 0 means "no limit" - get as many as possible
 	let after = req
 		.uri()
 		.query()
@@ -719,6 +720,15 @@ pub async fn api_subreddit_posts(req: Request<Body>) -> Result<Response<Body>, S
 		.query()
 		.and_then(|q| url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "sort").map(|(_, v)| v.into_owned()))
 		.unwrap_or_else(|| "hot".to_string());
+	let until = req
+		.uri()
+		.query()
+		.and_then(|q| url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "until").and_then(|(_, v)| v.parse::<u64>().ok()));
+
+	// If there's an "until" parameter or limit > 100, we might need to make multiple requests
+	if until.is_some() || limit > 100 || limit == 0 {
+		return fetch_posts_until_timestamp(sub, limit, after, sort, until.unwrap_or(0)).await;
+	}
 
 	// Build Reddit API path, including after and limit if present
 	let mut path = format!("/r/{}/{}.json?raw_json=1", sub, sort);
@@ -749,6 +759,120 @@ pub async fn api_subreddit_posts(req: Request<Body>) -> Result<Response<Body>, S
 		items,
 		after: after_val,
 	};
+	let body = serde_json::to_vec(&resp).map_err(|e| e.to_string())?;
+	Ok(Response::builder()
+		.header("content-type", "application/json")
+		.body(Body::from(body))
+		.unwrap())
+}
+
+// Helper function to fetch posts until a timestamp is reached
+async fn fetch_posts_until_timestamp(
+	sub: String,
+	limit: usize,
+	after: Option<String>,
+	sort: String,
+	until_timestamp: u64,
+) -> Result<Response<Body>, String> {
+	// Convert millisecond timestamp to seconds if needed (Reddit uses seconds)
+	// A timestamp of 0 means "fetch all posts"
+	let until_timestamp_sec = if until_timestamp > 0 {
+		if until_timestamp > 9999999999 {
+			until_timestamp / 1000
+		} else {
+			until_timestamp
+		}
+	} else {
+		0 // 0 means fetch all posts
+	};
+	
+	let mut all_posts = Vec::new();
+	let mut current_after = after;
+	let max_requests = 25; // Increase limit for larger fetches
+	let quarantined = false;
+	let request_limit = 100; // Reddit API max limit per request
+	
+	// Fetch posts in batches until we reach the timestamp or run out of posts
+	for _ in 0..max_requests {
+		let mut path = format!("/r/{}/{}.json?raw_json=1", sub, sort);
+		let mut params = vec![];
+		
+		if let Some(ref after_val) = current_after {
+			params.push(format!("after={}", after_val));
+		}
+		
+		// Always use maximum limit for Reddit API
+		params.push(format!("limit={}", request_limit));
+		
+		if !params.is_empty() {
+			path.push('&');
+			path.push_str(&params.join("&"));
+		}
+		
+		// Fetch posts
+		let (batch_posts, reddit_after) = match crate::utils::Post::fetch(&path, quarantined).await {
+			Ok((posts, after)) => (posts, after),
+			Err(msg) => return Err(msg),
+		};
+		
+		if batch_posts.is_empty() {
+			break;
+		}
+		
+		// Check if we've reached the timestamp
+		let oldest_post_time = batch_posts.iter().map(|p| p.created_ts).min().unwrap_or(0);
+		
+		// Add posts to our collection if they're newer than the until timestamp or if until=0
+		if until_timestamp_sec == 0 {
+			// If until=0, add all posts
+			all_posts.extend(batch_posts);
+		} else {
+			// Otherwise filter by timestamp
+			all_posts.extend(batch_posts.into_iter().filter(|p| p.created_ts >= until_timestamp_sec));
+		}
+		
+		// If we've reached the user's requested limit, stop fetching more
+		if limit != 0 && all_posts.len() >= limit {
+			break;
+		}
+		
+		// If the oldest post is older than our until timestamp or there are no more posts, stop
+		if until_timestamp_sec > 0 && oldest_post_time < until_timestamp_sec {
+			break;
+		}
+		
+		// If there are no more posts to fetch, stop
+		if reddit_after.is_empty() {
+			break;
+		}
+		
+		// Update for next iteration
+		current_after = Some(reddit_after);
+	}
+	
+	// Limit results to original requested limit if not 0
+	if limit != 0 && all_posts.len() > limit {
+		all_posts.truncate(limit);
+	}
+	
+	// Create flat posts from collected posts
+	let flat_posts: Vec<_> = all_posts.iter().map(FlatPost::from_post).collect();
+	
+	// Determine if there are more posts to fetch
+	let after_val = if all_posts.is_empty() {
+		None
+	} else if current_after.is_some() && current_after.as_deref() != Some("") {
+		// If we still had more posts to fetch
+		all_posts.last().map(|p| p.id.as_str())
+	} else {
+		None
+	};
+	
+	let resp = PaginatedPosts {
+		items: &flat_posts[..],
+		after: after_val,
+	};
+	
 	let body = serde_json::to_vec(&resp).map_err(|e| e.to_string())?;
 	Ok(Response::builder()
 		.header("content-type", "application/json")
